@@ -128,8 +128,6 @@ import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_
 import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_CHARGING
 import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_ICON
 import me.kavishdevar.librepods.utils.SystemApisUtils.METADATA_UNTETHERED_RIGHT_LOW_BATTERY_THRESHOLD
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.time.Duration.Companion.milliseconds
@@ -597,13 +595,16 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         telephonyManager = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
         phoneStateListener = object: TelephonyCallback(), TelephonyCallback.CallStateListener {
             override fun onCallStateChanged(state: Int) {
+                Log.i(TAG, "Phone call state changed: $state")
                 when (state) {
                     TelephonyManager.CALL_STATE_RINGING -> {
+                        isCallRinging = true
                         val leAvailableForAudio =
                             bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true
-//                        if ((CrossDevice.isAvailable && !isConnectedLocally && earDetectionNotification.status.contains(0x00)) || leAvailableForAudio) CoroutineScope(Dispatchers.IO).launch {
-                        if (leAvailableForAudio) runBlocking {
-                            takeOver("call")
+                        if (leAvailableForAudio && BluetoothConnectionManager.aacpSocket?.isConnected != true) {
+                            CoroutineScope(Dispatchers.IO).launch {
+                                takeOver("call")
+                            }
                         }
                         if (config.headGestures) {
                             handleIncomingCall()
@@ -611,18 +612,14 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     }
 
                     TelephonyManager.CALL_STATE_OFFHOOK -> {
-                        val leAvailableForAudio =
-                            bleManager.getMostRecentStatus()?.isLeftInEar == true || bleManager.getMostRecentStatus()?.isRightInEar == true
-//                        if ((CrossDevice.isAvailable && !isConnectedLocally && earDetectionNotification.status.contains(0x00)) || leAvailableForAudio) CoroutineScope(
-                        if (leAvailableForAudio) CoroutineScope(
-                            Dispatchers.IO
-                        ).launch {
-                            takeOver("call")
-                        }
+                        if (isCallRinging) gestureDetector?.stopDetection()
+                        isCallRinging = false
                         isInCall = true
                     }
 
                     TelephonyManager.CALL_STATE_IDLE -> {
+                        isCallRinging = false
+                        handleIncomingCallOnceConnected = false
                         isInCall = false
                         gestureDetector?.stopDetection()
                     }
@@ -1076,7 +1073,19 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             override fun onHeadTrackingReceived(headTracking: ByteArray) {
                 if (isHeadTrackingActive) {
                     HeadTracking.processPacket(headTracking)
-                    processHeadTrackingData(headTracking)
+                }
+            }
+
+            override fun onHeadTrackingSensorReceived(service: Int, payload: ByteArray) {
+                if (isHeadTrackingActive && payload.size == 58) {
+                    val trackingPacket = ByteArray(6) + payload
+                    // RTBuddy stores the gesture axes at payload offsets 28 (horizontal)
+                    // and 30 (vertical). Adapt them to the legacy offsets consumed below.
+                    trackingPacket[51] = payload[28]
+                    trackingPacket[52] = payload[29]
+                    trackingPacket[53] = payload[30]
+                    trackingPacket[54] = payload[31]
+                    HeadTracking.processPacket(trackingPacket)
                 }
             }
 
@@ -1646,6 +1655,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     private var gestureDetector: GestureDetector? = null
     private var isInCall = false
+    private var isCallRinging = false
     private var callNumber: String? = null
 
     private fun initGestureDetector() {
@@ -2107,9 +2117,15 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     fun handleIncomingCall() {
         if (isInCall) return
         if (config.headGestures) {
+            if (BluetoothConnectionManager.aacpSocket?.isConnected != true) {
+                Log.d(TAG, "Deferring call gesture detection until the AACP connection is ready")
+                handleIncomingCallOnceConnected = true
+                return
+            }
             initGestureDetector()
-            startHeadTracking()
             gestureDetector?.startDetection { accepted ->
+                Log.i(TAG, "Incoming-call head gesture detected: ${if (accepted) "yes" else "no"}")
+                if (!isCallRinging) return@startDetection
                 if (accepted) {
                     answerCall()
                     handleIncomingCallOnceConnected = false
@@ -2117,6 +2133,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     rejectCall()
                     handleIncomingCallOnceConnected = false
                 }
+                isCallRinging = false
             }
 
         }
@@ -2138,10 +2155,13 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private fun answerCall() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val telecomManager = getSystemService(TELECOM_SERVICE) as TelecomManager
-                if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED) {
-                    telecomManager.acceptRingingCall() // TODO: Switch to InCallService (needs CDM association)
+                if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED) {
+                    Log.e(TAG, "Cannot answer call: ANSWER_PHONE_CALLS permission is not granted")
+                    sendToast("Allow LibrePods to answer phone calls in Android settings")
+                    return
                 }
+                val telecomManager = getSystemService(TELECOM_SERVICE) as TelecomManager
+                telecomManager.acceptRingingCall() // TODO: Switch to InCallService (needs CDM association)
             } else {
                 val telephonyService = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
                 val telephonyClass = Class.forName(telephonyService.javaClass.name)
@@ -2165,9 +2185,16 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private fun rejectCall() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) != PackageManager.PERMISSION_GRANTED) {
+                    Log.e(TAG, "Cannot reject call: ANSWER_PHONE_CALLS permission is not granted")
+                    sendToast("Allow LibrePods to answer phone calls in Android settings")
+                    return
+                }
                 val telecomManager = getSystemService(TELECOM_SERVICE) as TelecomManager
-                if (checkSelfPermission(Manifest.permission.ANSWER_PHONE_CALLS) == PackageManager.PERMISSION_GRANTED) {
-                    telecomManager.endCall() // TODO: Switch to InCallService (needs CDM association)
+                if (!telecomManager.endCall()) {
+                    Log.e(TAG, "TelecomManager.endCall() did not end the ringing call")
+                    sendToast("Android could not reject the call")
+                    return
                 }
             } else {
                 val telephonyService = getSystemService(TELEPHONY_SERVICE) as TelephonyManager
@@ -2195,16 +2222,6 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
-    fun processHeadTrackingData(data: ByteArray) {
-        val horizontal = ByteBuffer.wrap(data, 51, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
-        val vertical = ByteBuffer.wrap(data, 53, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
-        try {
-            gestureDetector?.processHeadOrientation(horizontal, vertical)
-        } catch (e: Exception) {
-            Log.w(TAG, "gesture detector on ${data.toHexString()}: ${e.message}")
-        }
-    }
-
     private lateinit var connectionReceiver: BroadcastReceiver
 
     private fun resToUri(resId: Int): Uri? {
@@ -3144,35 +3161,25 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     fun startHeadTracking() {
         isHeadTrackingActive = true
-        val useAlternatePackets =
-            sharedPreferences.getBoolean("use_alternate_head_tracking_packets", true)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && aacpManager.getControlCommandStatus(
-                AACPManager.Companion.ControlCommandIdentifiers.OWNS_CONNECTION
-            )?.value?.get(0)?.toInt() != 1
-        ) {
-            takeOver("call", startHeadTrackingAgain = true)
-            Log.d(TAG, "Taking over for head tracking")
-        } else {
-            Log.w(TAG, "Will not be taking over for head tracking, might not work.")
-        }
-        if (useAlternatePackets) {
-            aacpManager.sendDataPacket(aacpManager.createAlternateStartHeadTrackingPacket())
-        } else {
-            aacpManager.sendStartHeadTracking()
-        }
+        aacpManager.sendHeadTrackingSensorRequest(headTrackingSensorService(), intervalMillis = 40)
         HeadTracking.reset()
     }
 
     fun stopHeadTracking() {
-        val useAlternatePackets =
-            sharedPreferences.getBoolean("use_alternate_head_tracking_packets", true)
-        if (useAlternatePackets) {
-            aacpManager.sendDataPacket(aacpManager.createAlternateStopHeadTrackingPacket())
-        } else {
-            aacpManager.sendStopHeadTracking()
-        }
+        val isAirPods5 = AirPodsModels.getModelByModelNumber(config.airpodsModelNumber)
+            ?.name?.startsWith("AirPods 5") == true
+        val firmwareMajor = config.airpodsVersion3.firstOrNull()?.digitToIntOrNull() ?: 8
+        val sensorService = if (isAirPods5 || firmwareMajor >= 8) 16 else 14 // DEVMOTION6 / ACTIVITY
+        aacpManager.sendHeadTrackingSensorRequest(sensorService, intervalMillis = 0)
         isHeadTrackingActive = false
         gestureDetector?.stopDetection()
+    }
+
+    private fun headTrackingSensorService(): Int {
+        val model = AirPodsModels.getModelByModelNumber(config.airpodsModelNumber)?.name
+        if (model?.startsWith("AirPods 5") == true) return 79 // CMA_COMMAND
+        val firmwareMajor = config.airpodsVersion3.firstOrNull()?.digitToIntOrNull() ?: 8
+        return if (firmwareMajor >= 8) 16 else 14 // DEVMOTION6 / ACTIVITY
     }
 
     @SuppressLint("MissingPermission")

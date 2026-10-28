@@ -27,6 +27,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.kavishdevar.librepods.services.AirPodsService
@@ -87,6 +88,7 @@ class GestureDetector(
 
     private var isRunning = false
     private var detectionJob: Job? = null
+    private var processingJob: Job? = null
     private var gestureDetectedCallback: ((Boolean) -> Unit)? = null
 
     private var significantMotion = false
@@ -110,6 +112,15 @@ fun startDetection(doNotStop: Boolean = false, onGestureDetected: (Boolean) -> U
 
         prevHorizontal = 0.0
         prevVertical = 0.0
+
+        processingJob = CoroutineScope(Dispatchers.Default).launch {
+            HeadTracking.acceleration.collect { acceleration ->
+                processHeadOrientation(
+                    horizontal = acceleration.horizontal.toInt(),
+                    vertical = acceleration.vertical.toInt(),
+                )
+            }
+        }
 
         detectionJob = CoroutineScope(Dispatchers.Default).launch {
             while (isRunning) {
@@ -138,6 +149,8 @@ fun startDetection(doNotStop: Boolean = false, onGestureDetected: (Boolean) -> U
 
         detectionJob?.cancel()
         detectionJob = null
+        processingJob?.cancel()
+        processingJob = null
         gestureDetectedCallback = null
     }
 

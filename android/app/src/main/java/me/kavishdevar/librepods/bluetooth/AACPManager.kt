@@ -246,6 +246,7 @@ class AACPManager {
         fun onHeadphoneAccommodationReceived(eqData: FloatArray)
         fun onCustomEqReceived(customEq: CustomEq)
         fun onCapabilitiesReceived(capabilities: List<Capability>)
+        fun onHeadTrackingSensorReceived(service: Int, payload: ByteArray)
     }
 
     fun parseStemPressResponse(data: ByteArray): Pair<StemPressType, StemPressBudType> {
@@ -484,6 +485,11 @@ class AACPManager {
             }
 
             Opcodes.HEADTRACKING -> {
+                val sensorData = parseHeadTrackingSensorPacket(packet)
+                if (sensorData != null) {
+                    callback?.onHeadTrackingSensorReceived(sensorData.first, sensorData.second)
+                    return
+                }
                 if (packet.size < 70) {
                     Log.w(
                         TAG, "Received HEADTRACKING packet too short: ${
@@ -660,6 +666,116 @@ class AACPManager {
 
     fun sendStartHeadTracking(): Boolean {
         return sendDataPacket(createStartHeadTrackingPacket())
+    }
+
+    /** Requests the RTBuddy motion sensor stream used by recent AirPods firmware. */
+    fun sendHeadTrackingSensorRequest(service: Int, intervalMillis: Int): Boolean {
+        val intervalMicros = intervalMillis.coerceAtLeast(0) * 1000
+        val configuration = byteArrayOf(
+            0x01,
+            intervalMicros.toByte(),
+            (intervalMicros ushr 8).toByte(),
+            (intervalMicros ushr 16).toByte(),
+            (intervalMicros ushr 24).toByte(),
+        )
+
+        // SensorServiceSetting { service: 1, setting: 2, configuration: 3 }
+        val setting = byteArrayOf(0x08, service.toByte(), 0x10, 0x02, 0x1A, configuration.size.toByte()) + configuration
+        // SensorDataWX.service_settings is field 8; RTBuddy SENSOR_DATA_WX is descriptor 0x00100000.
+        val sensorData = byteArrayOf(0x42, setting.size.toByte()) + setting
+        val buddyPayload = byteArrayOf(
+            0x00, 0x00, 0x10, 0x00,
+            sensorData.size.toByte(), 0x00,
+        ) + sensorData
+        return sendDataPacket(byteArrayOf(Opcodes.HEADTRACKING, 0x00) + buddyPayload)
+    }
+
+    private fun parseHeadTrackingSensorPacket(packet: ByteArray): Pair<Int, ByteArray>? {
+        // RTBuddy envelope: descriptor (uint32 LE), payload length (uint16 LE), protobuf.
+        if (packet.size < 12 || packet[6] != 0x00.toByte() || packet[7] != 0x00.toByte() ||
+            packet[8] != 0x10.toByte() || packet[9] != 0x00.toByte()
+        ) return null
+
+        val length = (packet[10].toInt() and 0xFF) or ((packet[11].toInt() and 0xFF) shl 8)
+        if (length <= 0 || packet.size < 12 + length) return null
+        val data = packet.copyOfRange(12, 12 + length)
+        var index = 0
+        while (index < data.size) {
+            val (tag, afterTag) = readVarint(data, index) ?: return null
+            index = afterTag
+            val field = (tag ushr 3).toInt()
+            val wireType = (tag and 7).toInt()
+            if (wireType != 2) {
+                index = skipProtoField(data, index, wireType) ?: return null
+                continue
+            }
+            val (fieldLength, afterLength) = readVarint(data, index) ?: return null
+            index = afterLength
+            val end = index + fieldLength.toInt()
+            if (fieldLength < 0 || end > data.size) return null
+            if (field == 7) {
+                return parseSensorCommand(data.copyOfRange(index, end))
+            }
+            index = end
+        }
+        return null
+    }
+
+    private fun parseSensorCommand(command: ByteArray): Pair<Int, ByteArray>? {
+        var service: Int? = null
+        var payload: ByteArray? = null
+        var index = 0
+        while (index < command.size) {
+            val (tag, afterTag) = readVarint(command, index) ?: return null
+            index = afterTag
+            when ((tag and 7).toInt()) {
+                0 -> {
+                    val (value, next) = readVarint(command, index) ?: return null
+                    if ((tag ushr 3).toInt() == 1) service = value.toInt()
+                    index = next
+                }
+                2 -> {
+                    val (length, afterLength) = readVarint(command, index) ?: return null
+                    index = afterLength
+                    val end = index + length.toInt()
+                    if (length < 0 || end > command.size) return null
+                    if ((tag ushr 3).toInt() == 3) payload = command.copyOfRange(index, end)
+                    index = end
+                }
+                else -> index = skipProtoField(command, index, (tag and 7).toInt()) ?: return null
+            }
+        }
+        val serviceValue = service ?: return null
+        val sensorPayload = payload ?: return null
+        return if (serviceValue == 14 || serviceValue == 15 || serviceValue == 16 || serviceValue == 79) {
+            serviceValue to sensorPayload
+        } else null
+    }
+
+    private fun readVarint(data: ByteArray, start: Int): Pair<Long, Int>? {
+        var value = 0L
+        var shift = 0
+        var index = start
+        while (index < data.size && shift < 64) {
+            val byte = data[index++].toInt() and 0xFF
+            value = value or ((byte and 0x7F).toLong() shl shift)
+            if (byte and 0x80 == 0) return value to index
+            shift += 7
+        }
+        return null
+    }
+
+    private fun skipProtoField(data: ByteArray, start: Int, wireType: Int): Int? {
+        return when (wireType) {
+            0 -> readVarint(data, start)?.second
+            1 -> (start + 8).takeIf { it <= data.size }
+            2 -> {
+                val (length, next) = readVarint(data, start) ?: return null
+                (next + length.toInt()).takeIf { length >= 0 && it <= data.size }
+            }
+            5 -> (start + 4).takeIf { it <= data.size }
+            else -> null
+        }
     }
 
     fun createStartHeadTrackingPacket(): ByteArray {
