@@ -1,6 +1,7 @@
 package me.kavishdevar.librepods.presentation.screens.onboarding
 
 import android.content.Intent
+import android.content.ComponentName
 import android.provider.Settings
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
@@ -50,6 +51,7 @@ import me.kavishdevar.librepods.presentation.MaterialIcons
 import me.kavishdevar.librepods.presentation.components.ListItemOrientation
 import me.kavishdevar.librepods.presentation.components.StyledList
 import me.kavishdevar.librepods.presentation.components.StyledListItem
+import me.kavishdevar.librepods.services.VoipCallNotificationListener
 
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
@@ -62,6 +64,7 @@ fun PermissionsPage(
 
     val context = LocalContext.current
     val canDrawOverlays = remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+    val hasNotificationAccess = remember { mutableStateOf(hasVoipNotificationAccess(context)) }
 
     val phonePermissionState = rememberMultiplePermissionsState(
         listOf(
@@ -111,6 +114,7 @@ fun PermissionsPage(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 canDrawOverlays.value = Settings.canDrawOverlays(context)
+                hasNotificationAccess.value = hasVoipNotificationAccess(context)
             }
         }
 
@@ -245,6 +249,41 @@ fun PermissionsPage(
                         }
                     },
                 )
+                val notificationAccessColor by animateColorAsState(
+                    if (hasNotificationAccess.value) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                )
+                val notificationAccessContainerColor by animateColorAsState(
+                    if (hasNotificationAccess.value) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHighest
+                )
+                StyledListItem(
+                    name = "VoIP calls",
+                    onClick = if (!hasNotificationAccess.value) {
+                        {
+                            grantingAll = false
+                            context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        }
+                    } else null,
+                    description = "Allow head gestures to answer or decline Telegram and WhatsApp calls",
+                    orientation = ListItemOrientation.Vertical,
+                    leadingContent = {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(
+                                    notificationAccessContainerColor,
+                                    MaterialShapes.SoftBurst.normalized().toShape()
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = MaterialIcons.call,
+                                contentDescription = "VoIP calls",
+                                modifier = Modifier.size(24.dp),
+                                tint = notificationAccessColor
+                            )
+                        }
+                    },
+                )
             }
 
             val animatedOverlayIconColor by animateColorAsState(if (canDrawOverlays.value) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface)
@@ -342,4 +381,13 @@ fun PermissionsPage(
             }
         }
     }
+}
+
+private fun hasVoipNotificationAccess(context: android.content.Context): Boolean {
+    val enabledListeners = Settings.Secure.getString(
+        context.contentResolver,
+        "enabled_notification_listeners"
+    ) ?: return false
+    val listener = ComponentName(context, VoipCallNotificationListener::class.java).flattenToString()
+    return enabledListeners.split(':').contains(listener)
 }

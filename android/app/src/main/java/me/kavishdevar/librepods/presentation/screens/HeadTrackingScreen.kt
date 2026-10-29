@@ -23,7 +23,9 @@
 
 package me.kavishdevar.librepods.presentation.screens
 
+import android.content.Intent
 import android.graphics.Paint
+import android.provider.Settings
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.core.tween
@@ -100,6 +102,7 @@ import kotlin.math.abs
 @Composable
 fun HeadTrackingScreen(viewModel: AirPodsViewModel, navigateToPurchase: () -> Unit) {
     val state by viewModel.uiState.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
     DisposableEffect(Unit) {
         viewModel.startHeadTracking()
         onDispose {
@@ -166,6 +169,25 @@ fun HeadTrackingScreen(viewModel: AirPodsViewModel, navigateToPurchase: () -> Un
                 description = stringResource(R.string.head_gestures_details),
                 header = true
             )
+
+            if (state.headGesturesEnabled) {
+                Spacer(modifier = Modifier.height(8.dp))
+                StyledButton(
+                    onClick = {
+                        context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                    },
+                    backdrop = backdrop,
+                    modifier = Modifier.fillMaxWidth(),
+                    maxScale = 0.03f,
+                    surfaceColor = MaterialTheme.colorScheme.surfaceContainerHighest
+                ) {
+                    Text(
+                        "Set up Telegram / WhatsApp call gestures",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
 
             Spacer(modifier = Modifier.height(16.dp))
 

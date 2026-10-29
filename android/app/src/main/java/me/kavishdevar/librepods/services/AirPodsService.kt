@@ -47,6 +47,7 @@ import android.content.pm.PackageManager
 import android.content.res.Resources
 import android.graphics.Color
 import android.media.AudioManager
+import android.view.KeyEvent
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Binder
@@ -618,10 +619,11 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     }
 
                     TelephonyManager.CALL_STATE_IDLE -> {
+                        val hadTelephonyCall = isCallRinging || isInCall
                         isCallRinging = false
-                        handleIncomingCallOnceConnected = false
+                        if (!isVoipCallRinging) handleIncomingCallOnceConnected = false
                         isInCall = false
-                        gestureDetector?.stopDetection()
+                        if (hadTelephonyCall && !isVoipCallRinging) gestureDetector?.stopDetection()
                     }
                 }
             }
@@ -794,6 +796,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         CoroutineScope(Dispatchers.IO).launch {
             bleManager.startScanning()
         }
+        VoipCallNotifications.observe(voipCallObserver)
     }
 
     @Suppress("unused")
@@ -1656,12 +1659,79 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private var gestureDetector: GestureDetector? = null
     private var isInCall = false
     private var isCallRinging = false
+    private var activeVoipCall: VoipCallNotification? = null
+    private var isVoipCallRinging = false
+    private val voipCallObserver: (VoipCallNotification?) -> Unit = ::onVoipCallNotificationChanged
     private var callNumber: String? = null
 
     private fun initGestureDetector() {
         if (gestureDetector == null) {
             gestureDetector = GestureDetector(this)
         }
+    }
+
+    private fun onVoipCallNotificationChanged(call: VoipCallNotification?) {
+        activeVoipCall = call
+        if (call == null) {
+            if (isVoipCallRinging) {
+                isVoipCallRinging = false
+                if (!isCallRinging) {
+                    handleIncomingCallOnceConnected = false
+                    gestureDetector?.stopDetection()
+                }
+            }
+            return
+        }
+
+        if (isCallRinging || isInCall || !config.headGestures || isVoipCallRinging) return
+        isVoipCallRinging = true
+        Log.i(TAG, "VoIP call ringing from ${call.packageName}")
+        val leAvailableForAudio = bleManager.getMostRecentStatus()?.let {
+            it.isLeftInEar == true || it.isRightInEar == true
+        } == true
+        if (leAvailableForAudio && BluetoothConnectionManager.aacpSocket?.isConnected != true) {
+            CoroutineScope(Dispatchers.IO).launch { takeOver("call") }
+        }
+        handleIncomingVoipCall()
+    }
+
+    private fun handleIncomingVoipCall() {
+        if (!isVoipCallRinging || isCallRinging || isInCall || !config.headGestures) return
+        if (BluetoothConnectionManager.aacpSocket?.isConnected != true) {
+            Log.d(TAG, "Deferring VoIP gesture detection until the AACP connection is ready")
+            handleIncomingCallOnceConnected = true
+            return
+        }
+
+        initGestureDetector()
+        gestureDetector?.startDetection { accepted ->
+            if (!isVoipCallRinging) return@startDetection
+            val call = activeVoipCall ?: return@startDetection
+            Log.i(TAG, "VoIP call head gesture detected: ${if (accepted) "yes" else "no"}")
+            val action = if (accepted) call.answer else call.decline
+            try {
+                if (action != null) {
+                    action.send()
+                } else {
+                    dispatchHeadsetHook()
+                }
+                sendToast(if (accepted) "VoIP call answered via head gesture" else "VoIP call declined via head gesture")
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not send VoIP call notification action", e)
+                sendToast("Could not control the VoIP call")
+            } finally {
+                isVoipCallRinging = false
+                handleIncomingCallOnceConnected = false
+                islandWindow?.close()
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun dispatchHeadsetHook() {
+        val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_HEADSETHOOK))
+        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_HEADSETHOOK))
     }
 
 
@@ -2769,7 +2839,13 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     aacpManager.sendSomePacketIDontKnowWhatItIs()
                     delay(200)
                     aacpManager.sendRequestProximityKeys((AACPManager.Companion.ProximityKeyType.IRK.value + AACPManager.Companion.ProximityKeyType.ENC_KEY.value).toByte())
-                    if (!handleIncomingCallOnceConnected) startHeadTracking() else handleIncomingCall()
+                    if (!handleIncomingCallOnceConnected) {
+                        startHeadTracking()
+                    } else if (isVoipCallRinging) {
+                        handleIncomingVoipCall()
+                    } else {
+                        handleIncomingCall()
+                    }
                     Handler(Looper.getMainLooper()).postDelayed({
                         aacpManager.sendPacket(aacpManager.createHandshakePacket())
                         aacpManager.sendSetFeatureFlagsPacket()
@@ -3123,6 +3199,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         Log.d(TAG, "Service stopped is being destroyed for some reason!")
 
         sharedPreferences.unregisterOnSharedPreferenceChangeListener(this)
+        VoipCallNotifications.clearObserver(voipCallObserver)
 
         try {
             unregisterReceiver(bluetoothReceiver)
