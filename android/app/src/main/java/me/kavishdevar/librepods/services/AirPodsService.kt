@@ -38,6 +38,7 @@ import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
 import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
@@ -52,12 +53,14 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Binder
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelUuid
 import android.os.UserHandle
 import android.provider.Settings
+import android.provider.MediaStore
 import android.telecom.TelecomManager
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
@@ -66,6 +69,7 @@ import android.util.TypedValue
 import android.view.View
 import android.widget.RemoteViews
 import android.widget.Toast
+import java.io.File
 import androidx.annotation.RequiresApi
 import androidx.annotation.RequiresPermission
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -85,6 +89,7 @@ import me.kavishdevar.librepods.BuildConfig
 import me.kavishdevar.librepods.MainActivity
 import me.kavishdevar.librepods.R
 import me.kavishdevar.librepods.bluetooth.AACPManager
+import me.kavishdevar.librepods.audio.HiResMicRecorder
 import me.kavishdevar.librepods.bluetooth.AACPManager.Companion.StemPressType
 import me.kavishdevar.librepods.bluetooth.ATTHandles
 import me.kavishdevar.librepods.bluetooth.ATTManagerv2
@@ -154,6 +159,10 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     var macAddress = ""
     var localMac = ""
     lateinit var aacpManager: AACPManager
+    data class HiResRecordingState(val recording: Boolean = false, val message: String? = null)
+    private val _hiResRecordingState = MutableStateFlow(HiResRecordingState())
+    val hiResRecordingState: StateFlow<HiResRecordingState> = _hiResRecordingState
+    private var hiResMicRecorder: HiResMicRecorder? = null
     lateinit var attManager: ATTManagerv2
     var airpodsInstance: AirPodsInstance? = null
     var cameraActive = false
@@ -214,6 +223,74 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     )
 
     private lateinit var config: ServiceConfig
+
+    fun startHiResRecording(): Boolean {
+        if (hiResMicRecorder != null) return true
+        val socket = BluetoothConnectionManager.aacpSocket
+        if (config.bleOnlyMode || socket?.isConnected != true) {
+            _hiResRecordingState.value = HiResRecordingState(message = "Connect to AirPods over Bluetooth before recording.")
+            return false
+        }
+
+        val output = File(cacheDir, "AirPods-${System.currentTimeMillis()}.wav")
+        val recorder = HiResMicRecorder(output) { result ->
+            val wasRecording = _hiResRecordingState.value.recording
+            aacpManager.audioPacketListener = null
+            if (wasRecording && BluetoothConnectionManager.aacpSocket?.isConnected == true) {
+                aacpManager.sendHiResMicStop()
+            }
+            hiResMicRecorder = null
+            _hiResRecordingState.value = result.fold(
+                onSuccess = { file ->
+                    val destination = publishHiResRecording(file)
+                    HiResRecordingState(message = destination?.let { "Saved recording in Music/LibrePods: $it" }
+                        ?: "Recording was captured but could not be added to Music; the file is at ${file.absolutePath}")
+                },
+                onFailure = { HiResRecordingState(message = "Recording failed: ${it.localizedMessage ?: "AAC-ELD decoding is unavailable on this device."}") }
+            )
+        }
+        hiResMicRecorder = recorder
+        aacpManager.audioPacketListener = recorder::offerSdu
+        if (!aacpManager.sendHiResMicStart()) {
+            aacpManager.audioPacketListener = null
+            hiResMicRecorder = null
+            recorder.stop()
+            _hiResRecordingState.value = HiResRecordingState(message = "Could not start the AirPods microphone stream.")
+            return false
+        }
+        _hiResRecordingState.value = HiResRecordingState(recording = true)
+        return true
+    }
+
+    fun stopHiResRecording() {
+        val recorder = hiResMicRecorder ?: return
+        aacpManager.audioPacketListener = null
+        if (BluetoothConnectionManager.aacpSocket?.isConnected == true) aacpManager.sendHiResMicStop()
+        _hiResRecordingState.value = HiResRecordingState(message = "Saving recording…")
+        recorder.stop()
+    }
+
+    private fun publishHiResRecording(file: File): String? {
+        val name = file.name
+        val values = ContentValues().apply {
+            put(MediaStore.Audio.Media.DISPLAY_NAME, name)
+            put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
+            put(MediaStore.Audio.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MUSIC}/LibrePods")
+            put(MediaStore.Audio.Media.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+        return try {
+            contentResolver.openOutputStream(uri)?.use { output -> file.inputStream().use { it.copyTo(output) } }
+                ?: error("Could not open Music file")
+            contentResolver.update(uri, ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }, null, null)
+            file.delete()
+            name
+        } catch (e: Exception) {
+            contentResolver.delete(uri, null, null)
+            Log.e(TAG, "Could not publish hi-res microphone recording", e)
+            null
+        }
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): AirPodsService = this@AirPodsService
@@ -695,6 +772,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 //                    isConnectedLocally = false
                     popupShown = false
                     updateNotificationContent(false)
+                    stopHiResRecording()
                     aacpManager.disconnected()
                     BluetoothConnectionManager.aacpSocket = null
                     BluetoothConnectionManager.attSocket = null
@@ -1111,7 +1189,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     "AirPodsParser",
                     "Stem press received: $stemPressType on $bud, cameraActive: $cameraActive, cameraAction: ${config.cameraAction}"
                 )
-                if (cameraActive && config.cameraAction != null && stemPressType == config.cameraAction) {
+                if (!isCallRinging && !isInCall && handleVoipCallStemPress(stemPressType)) {
+                    // An incoming VoIP call takes precedence over the configured media action.
+                } else if (cameraActive && config.cameraAction != null && stemPressType == config.cameraAction) {
                         Runtime.getRuntime().exec(arrayOf("su", "-c", "input keyevent 27"))
                 } else {
                     val action = getActionFor(bud, stemPressType)
@@ -1732,6 +1812,40 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_HEADSETHOOK))
         audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_HEADSETHOOK))
+    }
+
+    private fun handleVoipCallStemPress(stemPressType: StemPressType): Boolean {
+        val call = activeVoipCall ?: return false
+        val action = when (stemPressType) {
+            StemPressType.SINGLE_PRESS -> call.answer
+            StemPressType.DOUBLE_PRESS -> call.decline
+            else -> return false
+        }
+
+        return try {
+            if (action != null) action.send() else dispatchHeadsetHook()
+            Log.i(
+                TAG,
+                "VoIP call ${if (stemPressType == StemPressType.SINGLE_PRESS) "answered" else "declined"} via stem press"
+            )
+            sendToast(
+                if (stemPressType == StemPressType.SINGLE_PRESS) {
+                    "VoIP call answered via stem press"
+                } else {
+                    "VoIP call declined via stem press"
+                }
+            )
+            activeVoipCall = null
+            isVoipCallRinging = false
+            handleIncomingCallOnceConnected = false
+            gestureDetector?.stopDetection()
+            islandWindow?.close()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not send VoIP call action from stem press", e)
+            sendToast("Could not control the VoIP call")
+            true
+        }
     }
 
 
@@ -2864,27 +2978,32 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
                     while (socket.isConnected) {
                         try {
-                            val buffer = ByteArray(1024)
+                            // AACP 0x58 audio SDUs are larger than ordinary control packets.
+                            val buffer = ByteArray(4096)
                             val bytesRead = it.inputStream.read(buffer)
                             var data: ByteArray
                             if (bytesRead > 0) {
                                 data = buffer.copyOfRange(0, bytesRead)
-                                sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DATA).apply {
-                                    putExtra("data", buffer.copyOfRange(0, bytesRead))
-                                    setPackage(packageName)
-                                })
-                                val bytes = buffer.copyOfRange(0, bytesRead)
-                                val formattedHex = bytes.joinToString(" ") { "%02X".format(it) }
+                                val hiResAudioFrame = aacpManager.isHiResAudioPacket(data)
+                                if (!hiResAudioFrame) {
+                                    sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DATA).apply {
+                                        putExtra("data", data)
+                                        setPackage(packageName)
+                                    })
+                                }
 //                                    CrossDevice.sendReceivedPacket(bytes)
-                                updateNotificationContent(
-                                    true,
-                                    sharedPreferences.getString("name", device.name),
-                                    batteryNotification.getBattery()
-                                )
+                                if (!hiResAudioFrame) {
+                                    updateNotificationContent(
+                                        true,
+                                        sharedPreferences.getString("name", device.name),
+                                        batteryNotification.getBattery()
+                                    )
+                                }
 
                                 aacpManager.receivePacket(data)
 
-                                if (!isHeadTrackingData(data)) {
+                                if (!isHeadTrackingData(data) && !hiResAudioFrame) {
+                                    val formattedHex = data.joinToString(" ") { "%02X".format(it) }
                                     Log.d("AirPodsData", "Data received: $formattedHex")
                                     logPacket(data, "AirPods")
                                 }
@@ -2894,6 +3013,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                                 sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DISCONNECTED).apply {
                                     setPackage(packageName)
                                 })
+                                stopHiResRecording()
                                 aacpManager.disconnected()
                                 return@launch
                             }
@@ -2903,6 +3023,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                             sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DISCONNECTED).apply {
                                 setPackage(packageName)
                             })
+                            stopHiResRecording()
                             aacpManager.disconnected()
                             return@launch
                         }
@@ -2910,6 +3031,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                     }
                     Log.d("AirPods Service", "socket closed")
 //                        isConnectedLocally = false
+                    stopHiResRecording()
                     aacpManager.disconnected()
                     updateNotificationContent(false)
                     sendBroadcast(Intent(AirPodsNotifications.AIRPODS_DISCONNECTED).apply {
@@ -2969,6 +3091,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             Log.e(TAG, "error closing aacp socket ${e.message}")
         }
 //        isConnectedLocally = false
+        stopHiResRecording()
         aacpManager.disconnected()
 
         BluetoothConnectionManager.aacpSocket = null
@@ -3195,6 +3318,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
     @SuppressLint("MissingPermission")
     override fun onDestroy() {
+        stopHiResRecording()
         clearPacketLogs()
         Log.d(TAG, "Service stopped is being destroyed for some reason!")
 

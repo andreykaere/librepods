@@ -192,6 +192,14 @@ class AirPodsViewModel(
     private lateinit var sharedPreferences: SharedPreferences
     private lateinit var appContext: Context
     private lateinit var service: AirPodsService
+    private val _hiResRecordingState = MutableStateFlow(AirPodsService.HiResRecordingState())
+    val hiResRecordingState: StateFlow<AirPodsService.HiResRecordingState> = _hiResRecordingState
+
+    fun toggleHiResRecording() {
+        if (!::service.isInitialized) return
+        if (service.hiResRecordingState.value.recording) service.stopHiResRecording()
+        else service.startHiResRecording()
+    }
     private lateinit var controlRepo: ControlCommandRepository
 
     var isReady by mutableStateOf(false)
@@ -199,6 +207,9 @@ class AirPodsViewModel(
 
     fun init(service: AirPodsService, controlRepo: ControlCommandRepository, sharedPreferences: SharedPreferences, appContext: Context) {
         this.service = service
+        viewModelScope.launch {
+            service.hiResRecordingState.collect { _hiResRecordingState.value = it }
+        }
         this.controlRepo = controlRepo
         this.sharedPreferences = sharedPreferences
         this.appContext = appContext

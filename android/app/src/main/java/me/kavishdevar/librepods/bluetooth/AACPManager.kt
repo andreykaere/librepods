@@ -61,6 +61,13 @@ class AACPManager {
         }
 
         private val HEADER_BYTES = byteArrayOf(0x04, 0x00, 0x04, 0x00)
+        private val HI_RES_MIC_START = byteArrayOf(
+            0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x00, 0x00, 0x09, 0x00,
+            0x00, 0x01, 0x82.toByte(), 0x00, 0x00, 0x00, 0x04, 0x96.toByte(), 0x00
+        )
+        private val HI_RES_MIC_STOP = byteArrayOf(
+            0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x00, 0x00, 0x02, 0x00, 0x03, 0x01
+        )
 
         data class ControlCommandStatus(
             val identifier: ControlCommandIdentifiers, val value: ByteArray
@@ -282,6 +289,10 @@ class AACPManager {
 
     private var callback: PacketCallback? = null
 
+    /** Receives complete proprietary 0x58 audio SDUs while a recording is active. */
+    @Volatile
+    var audioPacketListener: ((ByteArray) -> Unit)? = null
+
     fun setPacketCallback(callback: PacketCallback) {
         this.callback = callback
     }
@@ -400,6 +411,10 @@ class AACPManager {
 
     @OptIn(ExperimentalStdlibApi::class)
     fun receivePacket(packet: ByteArray) {
+        if (isHiResAudioPacket(packet)) {
+            audioPacketListener?.invoke(packet)
+            return
+        }
         if (!packet.toHexString().startsWith("04000400")) {
             Log.w(
                 TAG, "Received packet does not start with expected header: ${
@@ -620,6 +635,16 @@ class AACPManager {
             }
         }
     }
+
+    fun sendHiResMicStart(): Boolean = sendPacket(HI_RES_MIC_START)
+
+    fun sendHiResMicStop(): Boolean = sendPacket(HI_RES_MIC_STOP)
+
+    fun isHiResAudioPacket(packet: ByteArray): Boolean =
+        packet.size >= 8 && packet[0] == 0x04.toByte() && packet[2] == 0x04.toByte() &&
+            packet[4] == 0x58.toByte() && packet[5] == 0x00.toByte() &&
+            packet[6] == 0x01.toByte() && packet[7] == 0x00.toByte()
+
 
     fun sendNotificationRequest(): Boolean {
         return sendDataPacket(createRequestNotificationPacket())
