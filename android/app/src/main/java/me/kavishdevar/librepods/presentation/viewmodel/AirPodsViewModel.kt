@@ -200,6 +200,13 @@ class AirPodsViewModel(
         if (service.hiResRecordingState.value.recording) service.stopHiResRecording()
         else service.startHiResRecording()
     }
+
+    fun startTelegramHiResMic(onPcm: (ByteArray) -> Unit): Boolean =
+        ::service.isInitialized && service.startHiResVoipMic(onPcm)
+
+    fun stopTelegramHiResMic() {
+        if (::service.isInitialized) service.stopHiResVoipMic()
+    }
     private lateinit var controlRepo: ControlCommandRepository
 
     var isReady by mutableStateOf(false)

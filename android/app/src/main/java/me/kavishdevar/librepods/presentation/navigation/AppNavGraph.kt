@@ -34,6 +34,8 @@ import me.kavishdevar.librepods.presentation.screens.OpenSourceLicensesScreen
 import me.kavishdevar.librepods.presentation.screens.PurchaseScreen
 import me.kavishdevar.librepods.presentation.screens.ReleaseNotesScreen
 import me.kavishdevar.librepods.presentation.screens.RenameScreen
+import me.kavishdevar.librepods.presentation.screens.RecordingScreenRoute
+import me.kavishdevar.librepods.presentation.screens.TelegramCallsScreen
 import me.kavishdevar.librepods.presentation.screens.TransparencySettingsScreen
 import me.kavishdevar.librepods.presentation.screens.TroubleshootingScreen
 import me.kavishdevar.librepods.presentation.screens.UpdateHearingTestRoute
@@ -111,6 +113,7 @@ fun AppNavGraph(
                                 navigateToTroubleshooting = { navigate(Screen.Troubleshooting) },
                                 navigateToCallControlScreen = { navigate(Screen.CallControl(it)) },
                                 navigateToMicrophoneSettings = { navigate(Screen.MicrophoneSettings) },
+                                navigateToHiResRecorder = { navigate(Screen.Recorder) },
                             )
                         }
 
@@ -255,6 +258,18 @@ fun AppNavGraph(
                         NavEntry(screen) {
                             if (!airPodsViewModel.isReady) LoadingScreen()
                             MicrophoneSettingsRoute(viewModel = airPodsViewModel)
+                        }
+
+                    Screen.Recorder ->
+                        NavEntry(screen) {
+                            RecordingScreenRoute(viewModel = airPodsViewModel) {
+                                navigate(Screen.TelegramCalls)
+                            }
+                        }
+
+                    Screen.TelegramCalls ->
+                        NavEntry(screen) {
+                            TelegramCallsScreen(viewModel = airPodsViewModel)
                         }
 
                     is Screen.ReleaseNotes ->

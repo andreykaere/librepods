@@ -14,7 +14,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Decodes AirPods' AACP 0x58 AAC-ELD uplink and stores it as a mono PCM WAV. */
-class HiResMicRecorder(private val outputFile: File, private val onStopped: (Result<File>) -> Unit) {
+class HiResMicRecorder(
+    private val outputFile: File?,
+    private val onStopped: (Result<File?>) -> Unit,
+    private val onLevel: (Float) -> Unit = {},
+    private val onPcm: (ByteArray) -> Unit = {}
+) {
     private val running = AtomicBoolean(true)
     private val sdus = ArrayBlockingQueue<ByteArray>(128)
     private val worker = Thread(::decodeLoop, "librepods-hires-mic").apply { start() }
@@ -36,8 +41,9 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
         var decoder: MediaCodec? = null
         var wav: WavWriter? = null
         var failure: Throwable? = null
+        var decodedBytes = 0L
         try {
-            outputFile.parentFile?.mkdirs()
+            outputFile?.parentFile?.mkdirs()
             decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
             val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, SAMPLE_RATE, CHANNELS)
             format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectELD)
@@ -63,7 +69,9 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
                             decoder.queueInputBuffer(inputIndex, 0, au.size, inputPtsUs, 0)
                             inputPtsUs += FRAME_DURATION_US
                         }
-                        wav = drainOutput(decoder, info, wav, outputFile, false)
+                        val drained = drainOutput(decoder, info, wav, outputFile, false)
+                        wav = drained.first
+                        decodedBytes += drained.second
                     }
                 }
                 if (endOfInput) {
@@ -71,9 +79,13 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
                     if (inputIndex >= 0) {
                         decoder.queueInputBuffer(inputIndex, 0, 0, inputPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                     }
-                    wav = drainOutput(decoder, info, wav, outputFile, true)
+                    val drained = drainOutput(decoder, info, wav, outputFile, true)
+                    wav = drained.first
+                    decodedBytes += drained.second
                 } else {
-                    wav = drainOutput(decoder, info, wav, outputFile, false)
+                    val drained = drainOutput(decoder, info, wav, outputFile, false)
+                    wav = drained.first
+                    decodedBytes += drained.second
                 }
             }
         } catch (t: Throwable) {
@@ -83,8 +95,8 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
             try { decoder?.stop() } catch (_: Exception) { }
             decoder?.release()
             try { wav?.close() } catch (t: Throwable) { if (failure == null) failure = t }
-            if (failure == null && (wav == null || wav.dataBytes == 0L)) {
-                outputFile.delete()
+            if (failure == null && decodedBytes == 0L) {
+                outputFile?.delete()
                 failure = IllegalStateException("AirPods did not provide decodable audio")
             }
             onStopped(if (failure == null) Result.success(outputFile) else Result.failure(failure!!))
@@ -95,16 +107,17 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
         decoder: MediaCodec,
         info: MediaCodec.BufferInfo,
         currentWriter: WavWriter?,
-        file: File,
+        file: File?,
         drainAll: Boolean
-    ): WavWriter? {
+    ): Pair<WavWriter?, Long> {
         var writer = currentWriter
+        var bytesWritten = 0L
         var first = true
         while (true) {
             val index = decoder.dequeueOutputBuffer(info, if (first || drainAll) TIMEOUT_US else 0)
             first = false
             when {
-                index == MediaCodec.INFO_TRY_AGAIN_LATER -> return writer
+                index == MediaCodec.INFO_TRY_AGAIN_LATER -> return writer to bytesWritten
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     val outputFormat = decoder.outputFormat
                     val channels = outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
@@ -114,19 +127,23 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
                     // The AirPods AAC-ELD stream is clocked at 64 kHz. Android codec
                     // implementations may report their internal/output rate differently;
                     // the rewrite recorder also keeps the WAV timeline at 64 kHz.
-                    writer = writer ?: WavWriter(file, SAMPLE_RATE, channels)
+                    if (file != null) writer = writer ?: WavWriter(file, SAMPLE_RATE, channels)
                 }
                 index >= 0 -> {
                     val output = decoder.getOutputBuffer(index)
                     if (output != null && info.size > 0) {
-                        if (writer == null) writer = WavWriter(file, SAMPLE_RATE, CHANNELS)
                         output.position(info.offset)
                         output.limit(info.offset + info.size)
-                        writer.write(output)
+                        onLevel(calculateLevel(output))
+                        val pcm = ByteArray(output.remaining())
+                        output.duplicate().get(pcm)
+                        onPcm(pcm)
+                        writer?.write(output)
+                        bytesWritten += info.size
                     }
                     val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                     decoder.releaseOutputBuffer(index, false)
-                    if (eos) return writer
+                    if (eos) return writer to bytesWritten
                 }
             }
         }
@@ -143,6 +160,15 @@ class HiResMicRecorder(private val outputFile: File, private val onStopped: (Res
             offset = start + size
         }
         return result
+    }
+
+    private fun calculateLevel(buffer: ByteBuffer): Float {
+        val samples = buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        var peak = 0
+        while (samples.remaining() >= 2) {
+            peak = maxOf(peak, kotlin.math.abs(samples.short.toInt()))
+        }
+        return (peak / 32768f).coerceIn(0f, 1f)
     }
 
     private class WavWriter(file: File, private val sampleRate: Int, private val channels: Int) : AutoCloseable {

@@ -159,7 +159,11 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     var macAddress = ""
     var localMac = ""
     lateinit var aacpManager: AACPManager
-    data class HiResRecordingState(val recording: Boolean = false, val message: String? = null)
+    data class HiResRecordingState(
+        val recording: Boolean = false,
+        val message: String? = null,
+        val level: Float = 0f
+    )
     private val _hiResRecordingState = MutableStateFlow(HiResRecordingState())
     val hiResRecordingState: StateFlow<HiResRecordingState> = _hiResRecordingState
     private var hiResMicRecorder: HiResMicRecorder? = null
@@ -225,15 +229,26 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     private lateinit var config: ServiceConfig
 
     fun startHiResRecording(): Boolean {
-        if (hiResMicRecorder != null) return true
+        return startHiResMicCapture(File(cacheDir, "AirPods-${System.currentTimeMillis()}.wav"), null)
+    }
+
+    fun startHiResVoipMic(onPcm: (ByteArray) -> Unit): Boolean {
+        return startHiResMicCapture(null, onPcm)
+    }
+
+    fun stopHiResVoipMic() = stopHiResRecording()
+
+    private fun startHiResMicCapture(output: File?, pcmSink: ((ByteArray) -> Unit)?): Boolean {
+        if (hiResMicRecorder != null) return false
         val socket = BluetoothConnectionManager.aacpSocket
         if (config.bleOnlyMode || socket?.isConnected != true) {
-            _hiResRecordingState.value = HiResRecordingState(message = "Connect to AirPods over Bluetooth before recording.")
+            _hiResRecordingState.value = HiResRecordingState(message = "Connect to AirPods over Bluetooth before using the hi-res microphone.")
             return false
         }
 
-        val output = File(cacheDir, "AirPods-${System.currentTimeMillis()}.wav")
-        val recorder = HiResMicRecorder(output) { result ->
+        val recorder = HiResMicRecorder(
+            output,
+            onStopped = { result ->
             val wasRecording = _hiResRecordingState.value.recording
             aacpManager.audioPacketListener = null
             if (wasRecording && BluetoothConnectionManager.aacpSocket?.isConnected == true) {
@@ -242,13 +257,23 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             hiResMicRecorder = null
             _hiResRecordingState.value = result.fold(
                 onSuccess = { file ->
-                    val destination = publishHiResRecording(file)
-                    HiResRecordingState(message = destination?.let { "Saved recording in Music/LibrePods: $it" }
-                        ?: "Recording was captured but could not be added to Music; the file is at ${file.absolutePath}")
+                    if (file == null) {
+                        HiResRecordingState(message = "Hi-res microphone stopped.")
+                    } else {
+                        val destination = publishHiResRecording(file)
+                        HiResRecordingState(message = destination?.let { "Saved recording in Music/LibrePods: $it" }
+                            ?: "Recording was captured but could not be added to Music; the file is at ${file.absolutePath}")
+                    }
                 },
                 onFailure = { HiResRecordingState(message = "Recording failed: ${it.localizedMessage ?: "AAC-ELD decoding is unavailable on this device."}") }
             )
-        }
+            },
+            onLevel = { level ->
+                val current = _hiResRecordingState.value
+                if (current.recording) _hiResRecordingState.value = current.copy(level = level)
+            },
+            onPcm = pcmSink ?: {}
+        )
         hiResMicRecorder = recorder
         aacpManager.audioPacketListener = recorder::offerSdu
         if (!aacpManager.sendHiResMicStart()) {

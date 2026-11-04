@@ -78,6 +78,12 @@ sealed interface Screen: NavKey {
     data object MicrophoneSettings: Screen
 
     @Serializable
+    data object Recorder: Screen
+
+    @Serializable
+    data object TelegramCalls: Screen
+
+    @Serializable
     data object ReleaseNotes: Screen {
         override val showTopBar: Boolean = false
     }

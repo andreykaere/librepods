@@ -123,7 +123,6 @@ import me.kavishdevar.librepods.presentation.theme.LocalDesignSystem
 import me.kavishdevar.librepods.presentation.viewmodel.AirPodsUiState
 import me.kavishdevar.librepods.presentation.viewmodel.AirPodsViewModel
 import me.kavishdevar.librepods.presentation.viewmodel.demoState
-import me.kavishdevar.librepods.services.AirPodsService
 import java.util.concurrent.TimeUnit
 import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.math.min
@@ -145,10 +144,10 @@ fun AirPodsSettingsRoute(
     navigateToVersion: () -> Unit,
     navigateToTroubleshooting: () -> Unit,
     navigateToCallControlScreen: (action: String) -> Unit,
-    navigateToMicrophoneSettings: () -> Unit
+    navigateToMicrophoneSettings: () -> Unit,
+    navigateToHiResRecorder: () -> Unit
 ) {
     val state by viewModel.uiState.collectAsState()
-    val hiResRecordingState by viewModel.hiResRecordingState.collectAsState()
 
     val m3eEnabled = LocalDesignSystem.current == DesignSystem.Material
     val topPadding = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + if (m3eEnabled) 0.dp else 84.dp
@@ -192,8 +191,7 @@ fun AirPodsSettingsRoute(
             navigateToTroubleshooting = navigateToTroubleshooting,
             navigateToCallControlScreen = navigateToCallControlScreen,
             navigateToMicrophoneSettings = navigateToMicrophoneSettings,
-            hiResRecordingState = hiResRecordingState,
-            onHiResRecordingClick = viewModel::toggleHiResRecording,
+            navigateToHiResRecorder = navigateToHiResRecorder,
 
             activateDemoMode = viewModel::activateDemoMode,
             reconnectFromSavedMac = viewModel::reconnectFromSavedMac
@@ -236,8 +234,7 @@ fun AirPodsSettingsScreen(
         navigateToTroubleshooting: () -> Unit,
         navigateToCallControlScreen: (action: String) -> Unit,
         navigateToMicrophoneSettings: () -> Unit,
-        hiResRecordingState: AirPodsService.HiResRecordingState = AirPodsService.HiResRecordingState(),
-        onHiResRecordingClick: () -> Unit = {},
+        navigateToHiResRecorder: () -> Unit = {},
 
         activateDemoMode: () -> Unit,
         reconnectFromSavedMac: () -> Unit,
@@ -524,15 +521,10 @@ fun AirPodsSettingsScreen(
             }
 
             item(key = "hi_res_mic_recording") {
-                val recordingDescription = when {
-                    hiResRecordingState.recording -> "Recording from AirPods in AAC-ELD. Tap to stop and save the WAV file."
-                    hiResRecordingState.message != null -> hiResRecordingState.message
-                    else -> "Record the AirPods' 64 kHz AAC-ELD microphone stream to a WAV file."
-                }
                 StyledListItem(
-                    name = if (hiResRecordingState.recording) "Stop hi-res microphone recording" else "Hi-res microphone recording",
-                    description = recordingDescription,
-                    onClick = onHiResRecordingClick
+                    name = "Recorder",
+                    description = "Record and listen to audio captured from your AirPods microphone.",
+                    onClick = navigateToHiResRecorder
                 )
             }
 

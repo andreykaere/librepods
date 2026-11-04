@@ -72,6 +72,8 @@ fun NavigationRoot(
         Screen.VersionInfo -> stringResource(R.string.version)
         is Screen.CallControl -> currentScreen.action
         Screen.MicrophoneSettings -> stringResource(R.string.microphone_mode)
+        Screen.Recorder -> stringResource(R.string.recorder)
+        Screen.TelegramCalls -> stringResource(R.string.telegram_calls)
         Screen.ReleaseNotes -> ""
     }
 
