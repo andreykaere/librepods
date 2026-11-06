@@ -139,6 +139,13 @@ import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.time.Duration.Companion.milliseconds
 
 private const val TAG = "AirPodsService"
+private const val HI_RES_MIC_STOP_DRAIN_MS = 250L
+private const val A2DP_SUSPEND_DURATION_MS = 500L
+private const val A2DP_RESUME_SETTLE_MS = 300L
+private const val A2DP_OUTPUT_PROBE_DELAY_MS = 150L
+private const val A2DP_OUTPUT_PROBE_ATTEMPTS = 4
+private const val A2DP_SUSPENDED_TRUE = "A2dpSuspended=true"
+private const val A2DP_SUSPENDED_FALSE = "A2dpSuspended=false"
 
 object ServiceManager {
     private var service: AirPodsService? = null
@@ -166,7 +173,12 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     )
     private val _hiResRecordingState = MutableStateFlow(HiResRecordingState())
     val hiResRecordingState: StateFlow<HiResRecordingState> = _hiResRecordingState
+    @Volatile
     private var hiResMicRecorder: HiResMicRecorder? = null
+    @Volatile
+    private var hiResMicStopPending = false
+    @Volatile
+    private var hiResMicWasStarted = false
     lateinit var attManager: ATTManagerv2
     var airpodsInstance: AirPodsInstance? = null
     var cameraActive = false
@@ -239,7 +251,7 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
     fun stopHiResVoipMic() = stopHiResRecording()
 
     private fun startHiResMicCapture(output: File?, pcmSink: ((ByteArray) -> Unit)?): Boolean {
-        if (hiResMicRecorder != null) return false
+        if (hiResMicRecorder != null || hiResMicStopPending) return false
         val socket = BluetoothConnectionManager.aacpSocket
         if (config.bleOnlyMode || socket?.isConnected != true) {
             _hiResRecordingState.value = HiResRecordingState(message = "Connect to AirPods over Bluetooth before using the hi-res microphone.")
@@ -250,11 +262,17 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
             output,
             onStopped = { result ->
             val wasRecording = _hiResRecordingState.value.recording
+            val restoreStereoPlayback = hiResMicWasStarted
             aacpManager.audioPacketListener = null
             if (wasRecording && BluetoothConnectionManager.aacpSocket?.isConnected == true) {
+                // The decoder can fail while capture is active. Make sure the AirPods
+                // receive the protocol stop command even when the user did not stop it.
                 aacpManager.sendHiResMicStop()
             }
             hiResMicRecorder = null
+            // Keep new capture attempts blocked until the A2DP route refresh finishes.
+            hiResMicStopPending = restoreStereoPlayback
+            hiResMicWasStarted = false
             _hiResRecordingState.value = result.fold(
                 onSuccess = { file ->
                     if (file == null) {
@@ -267,6 +285,13 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 },
                 onFailure = { HiResRecordingState(message = "Recording failed: ${it.localizedMessage ?: "AAC-ELD decoding is unavailable on this device."}") }
             )
+            if (restoreStereoPlayback) {
+                restoreBluetoothStereoOutput {
+                    hiResMicStopPending = false
+                }
+            } else {
+                hiResMicStopPending = false
+            }
             },
             onLevel = { level ->
                 val current = _hiResRecordingState.value
@@ -279,21 +304,117 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         if (!aacpManager.sendHiResMicStart()) {
             aacpManager.audioPacketListener = null
             hiResMicRecorder = null
+            hiResMicStopPending = false
+            hiResMicWasStarted = false
             recorder.stop()
             _hiResRecordingState.value = HiResRecordingState(message = "Could not start the AirPods microphone stream.")
             return false
         }
+        hiResMicWasStarted = true
         _hiResRecordingState.value = HiResRecordingState(recording = true)
         return true
     }
 
     fun stopHiResRecording() {
         val recorder = hiResMicRecorder ?: return
-        aacpManager.audioPacketListener = null
-        if (BluetoothConnectionManager.aacpSocket?.isConnected == true) aacpManager.sendHiResMicStop()
+        if (hiResMicStopPending) return
+
+        hiResMicStopPending = true
         _hiResRecordingState.value = HiResRecordingState(message = "Saving recording…")
-        recorder.stop()
+
+        // Stop the AirPods microphone first, but keep accepting in-flight SDUs briefly.
+        // This lets the decoder finish the last AAC-ELD frames before it is drained.
+        if (BluetoothConnectionManager.aacpSocket?.isConnected == true) {
+            aacpManager.sendHiResMicStop()
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            delay(HI_RES_MIC_STOP_DRAIN_MS)
+            if (hiResMicRecorder === recorder) {
+                aacpManager.audioPacketListener = null
+                recorder.stop()
+            }
+        }
     }
+
+    /**
+     * Restarts the Android Bluetooth A2DP output after the proprietary AirPods
+     * microphone stream has completely stopped and its decoder has drained.
+     *
+     * Pixel 7 (GS201) ships the standard Android A2DP audio-policy configuration.
+     * A2dpSuspended is the framework-to-audio-HAL parameter Android uses for this
+     * transition. A vendor HAL may still ignore an app-originated parameter, so
+     * this method logs each stage and always requests resume in the finally block.
+     */
+    private fun restoreBluetoothStereoOutput(onComplete: () -> Unit) {
+        CoroutineScope(Dispatchers.IO).launch {
+            var audioManager: AudioManager? = null
+            var suspendWasRequested = false
+            try {
+                audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+                // The A2DP device can briefly disappear from AudioManager while the
+                // AirPods finish leaving the proprietary microphone transport. Probe
+                // for a short period instead of skipping the refresh immediately.
+                var hasA2dpOutput = false
+                for (attempt in 0 until A2DP_OUTPUT_PROBE_ATTEMPTS) {
+                    hasA2dpOutput = hasBluetoothA2dpOutput(audioManager)
+                    if (hasA2dpOutput) break
+                    if (attempt < A2DP_OUTPUT_PROBE_ATTEMPTS - 1) {
+                        delay(A2DP_OUTPUT_PROBE_DELAY_MS)
+                    }
+                }
+
+                if (!hasA2dpOutput) {
+                    Log.w(
+                        TAG,
+                        "A2DP output did not reappear after hi-res mic stop on " +
+                            "${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE}); " +
+                            "skipping A2DP suspend cycle"
+                    )
+                    return@launch
+                }
+
+                Log.i(
+                    TAG,
+                    "Requesting A2DP sink restart on ${Build.MANUFACTURER} ${Build.MODEL} " +
+                        "(${Build.DEVICE}): suspend for ${A2DP_SUSPEND_DURATION_MS} ms"
+                )
+
+                // Match the sink-out / 500 ms / sink-in sequence used by EarPort.
+                // Android's AudioDeviceBroker forwards this standard parameter to
+                // the audio HAL; on the Pixel 7 platform (GS201), the A2DP policy
+                // configuration is part of the device build.
+                suspendWasRequested = true
+                audioManager.setParameters(A2DP_SUSPENDED_TRUE)
+                delay(A2DP_SUSPEND_DURATION_MS)
+            } catch (t: Throwable) {
+                Log.w(TAG, "A2DP suspend stage failed during hi-res mic recovery", t)
+            } finally {
+                if (suspendWasRequested) {
+                    try {
+                        audioManager?.setParameters(A2DP_SUSPENDED_FALSE)
+                        Log.i(TAG, "A2DP resume requested; waiting for route to settle")
+                        delay(A2DP_RESUME_SETTLE_MS)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Could not resume A2DP output after hi-res mic capture", t)
+                    }
+                }
+                // Do not allow another hi-res capture to start until the sink has
+                // had time to reopen after the resume request.
+                onComplete()
+            }
+        }
+    }
+
+    private fun hasBluetoothA2dpOutput(audioManager: AudioManager): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isBluetoothA2dpOn
+        }
 
     private fun publishHiResRecording(file: File): String? {
         val name = file.name

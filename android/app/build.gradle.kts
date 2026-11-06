@@ -131,6 +131,8 @@ dependencies {
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.webkit)
+    // implementation(libs.androidx.webkit:webkit:1.12.1)
+    // implementation("libs.androidx.webkit:webkit:1.12.1")
     implementation(libs.android.deepfilternet)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.ui)
